@@ -22,7 +22,7 @@
 #
 set -Eeuo pipefail
 
-VERSION="0.1.1"
+VERSION="0.1.8"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 TARGET="/mnt/gentoo"
 CONF_FILE="./asahi-gentoo.conf"
@@ -33,10 +33,10 @@ RET=""
 # ---------------------------------------------------------------- config ----
 CONFIG_VARS=(
   ESP_PART ROOT_PART SWAP_PART ESP_MOUNT ROOT_FS USE_LUKS
-  STAGE_VARIANT GENTOO_MIRROR PROFILE
+  LIBC STAGE_VARIANT GENTOO_MIRROR PROFILE
   HOSTNAME_ TIMEZONE LOCALE KEYMAP
   ROOT_PW_HASH USER_NAME USER_PW_HASH USER_GROUPS
-  OPTIONS NETWORK EXTRA_PACKAGES EXTRA_USE
+  OPTIONS NETWORK EXTRA_PACKAGES EXTRA_USE BUILD_JOBS
   ASAHI_SETUP ASAHI_OVERLAY_URI ASAHI_SUPPORT_URI
 )
 
@@ -45,6 +45,7 @@ set_defaults() {
   ESP_MOUNT="/boot"           # Required by the Gentoo Asahi firmware and boot integration
   ROOT_FS="ext4"              # ext4 | btrfs | xfs
   USE_LUKS="no"
+  LIBC="glibc"
   STAGE_VARIANT="desktop-openrc"
   GENTOO_MIRROR="https://distfiles.gentoo.org"
   PROFILE="ask-later"         # preset path | ask-later (pick from eselect list in chroot)
@@ -54,6 +55,7 @@ set_defaults() {
   KEYMAP="us"
   ROOT_PW_HASH=""; USER_NAME=""; USER_PW_HASH=""
   USER_GROUPS="wheel,audio,video,input,users"
+  BUILD_JOBS="4"             # compile jobs per package: 1..256 or auto
   OPTIONS="VERIFY SUDO"       # flags, see OPTION_ITEMS
   NETWORK="iwd"               # iwd | networkmanager | none
   EXTRA_PACKAGES=""; EXTRA_USE=""
@@ -71,6 +73,7 @@ OPTION_ITEMS=(
   "GITSYNC"   "Sync the Gentoo tree via git instead of rsync"
   "WORLD"     "Run full @world update after setup (slow)"
   "NATIVE"    "Optimize for this CPU (-mcpu=native)"
+  "ASAHI_KDE" "Enable Asahi KDE/KWin integration (pulls KDE libraries)"
   "SUDO"      "Install sudo and allow the wheel group"
   "SSHD"      "Install and enable sshd"
   "CHRONY"    "Install and enable chrony (time sync)"
@@ -265,7 +268,29 @@ cfg_filesystem() {
     USE_LUKS=yes; else USE_LUKS=no; fi
 }
 
+cfg_libc() {
+  ui_menu "C library" "Choose libc for a NEW installation. musl Asahi support is experimental." \
+    glibc "glibc (default, widest compatibility)" musl "musl (experimental, source builds)" || return 0
+  [[ $RET != "$LIBC" ]] || return 0
+  LIBC=$RET; PROFILE=ask-later
+  if [[ $LIBC == musl ]]; then
+    LOCALE=C.UTF-8
+    STAGE_VARIANT=musl-openrc
+    ASAHI_SETUP=native
+    local item kept=""
+    for item in $OPTIONS; do [[ $item == BINPKG ]] || kept+="$item "; done
+    OPTIONS=${kept% }
+    ui_msg "musl" "Selected musl/OpenRC and native Asahi setup. The glibc binary host is disabled. Asahi package compatibility on musl is not verified."
+  else STAGE_VARIANT=desktop-openrc; fi
+}
+
 cfg_stage() {
+  if [[ $LIBC == musl ]]; then
+    ui_menu "musl stage3" "arm64 musl stage (experimental)" \
+      musl-openrc "musl, OpenRC" musl-systemd "musl, systemd" \
+      musl-llvm-openrc "musl/LLVM, OpenRC" musl-llvm-systemd "musl/LLVM, systemd" \
+      musl-hardened-openrc "musl hardened, OpenRC" musl-hardened-systemd "musl hardened, systemd" || return 0
+  else
   ui_menu "Stage3 variant" "arm64 stage3 tarball to install" \
     openrc          "Minimal, OpenRC" \
     systemd         "Minimal, systemd" \
@@ -273,6 +298,7 @@ cfg_stage() {
     desktop-systemd "Desktop, systemd" \
     llvm-openrc     "LLVM/clang toolchain, OpenRC" \
     llvm-systemd    "LLVM/clang toolchain, systemd" || return 0
+  fi
   STAGE_VARIANT=$RET
   # a profile must match the init system, reset it
   PROFILE="ask-later"
@@ -282,6 +308,15 @@ cfg_stage() {
 cfg_profile() {
   local sd=""; [[ $STAGE_VARIANT == *systemd ]] && sd="/systemd"
   local b="default/linux/arm64/23.0"
+  if [[ $LIBC == musl ]]; then
+    b+="/musl"
+    [[ $STAGE_VARIANT != *llvm* ]] || b+="/llvm"
+    [[ $STAGE_VARIANT != *hardened* ]] || b+="/hardened"
+    ui_menu "musl profile" "Choose a musl profile matching the selected stage" \
+      ask-later "Choose in chroot" "$b$sd" "Matching musl profile" custom "Enter profile path" || return 0
+    if [[ $RET == custom ]]; then ui_input "Profile" "musl profile path" "$b$sd" || return 0; fi
+    PROFILE=$RET; return 0
+  fi
   ui_menu "Profile" "Portage profile (init system must match the stage3: ${STAGE_VARIANT##*-})" \
     ask-later              "Pick from 'eselect profile list' inside the chroot" \
     "$b$sd"                "Base" \
@@ -307,6 +342,16 @@ cfg_users() {
     ask_password "Password for $USER_NAME" && USER_PW_HASH=$RET || return 0
     ui_input "Groups" "Supplementary groups" "$USER_GROUPS" && USER_GROUPS=$RET || true
   else USER_NAME=""; USER_PW_HASH=""; fi
+}
+
+valid_build_jobs() {
+  [[ $1 == auto || $1 =~ ^([1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-6])$ ]]
+}
+
+cfg_build_jobs() {
+  ui_input "Build jobs" "Compile jobs per package (1-256), or auto. Packages build one at a time." "$BUILD_JOBS" || return 0
+  if valid_build_jobs "$RET"; then BUILD_JOBS=$RET
+  else ui_msg "Build jobs" "Enter a whole number from 1 to 256, or auto."; fi
 }
 
 cfg_options() {
@@ -335,11 +380,25 @@ cfg_asahi() {
   ui_input "Support repo" "asahi-gentoosupport git URI" "$ASAHI_SUPPORT_URI" && ASAHI_SUPPORT_URI=$RET || true
 }
 
+# Validate syntax here; live media may omit tzdata entirely. Validate the
+# actual timezone file inside Gentoo after ensuring tzdata is installed.
+valid_timezone_name() {
+  [[ $1 =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]]
+}
+
+ensure_target_timezone() {
+  if [[ ! -f /usr/share/zoneinfo/$TIMEZONE ]]; then
+    emerge_pkgs sys-libs/timezone-data
+  fi
+  [[ -f /usr/share/zoneinfo/$TIMEZONE ]] || die "Timezone '$TIMEZONE' is not present in Gentoo timezone-data. Check the spelling."
+}
+
 validate_config() {
   local err="" p t id seen=" "
   [[ -b $ESP_PART  ]] || err+="ESP partition not set or missing.\n"
   [[ -b $ROOT_PART ]] || err+="Root partition not set or missing.\n"
   [[ -z $SWAP_PART || -b $SWAP_PART ]] || err+="Swap partition missing.\n"
+  valid_build_jobs "$BUILD_JOBS" || err+="Build jobs must be 1-256 or auto.\n"
   [[ -n $ROOT_PW_HASH ]] || err+="Root password not set.\n"
   [[ $ESP_PART != "$ROOT_PART" ]] || err+="ESP and root are the same partition.\n"
   for p in "$ESP_PART" "$ROOT_PART" "$SWAP_PART"; do
@@ -365,15 +424,26 @@ validate_config() {
   [[ $ESP_MOUNT == /boot ]] || err+="This installer requires the Asahi ESP at /boot.\n"
   [[ $ASAHI_SETUP != gentoosupport || $ESP_MOUNT == /boot ]] || err+="gentoosupport requires ESP_MOUNT=/boot.\n"
   [[ $HOSTNAME_ =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || err+="Invalid hostname.\n"
-  [[ $TIMEZONE != /* && $TIMEZONE != *..* && -f /usr/share/zoneinfo/$TIMEZONE ]] || err+="Unknown timezone.\n"
+  valid_timezone_name "$TIMEZONE" || err+="Invalid timezone name. Use a name such as America/New_York.\n"
   [[ $LOCALE =~ ^[a-zA-Z0-9_.@-]+$ ]] || err+="Invalid locale.\n"
   [[ $KEYMAP =~ ^[a-zA-Z0-9_./-]+$ ]] || err+="Invalid keymap.\n"
   case $ROOT_FS in ext4|btrfs|xfs) ;; *) err+="Invalid root filesystem.\n" ;; esac
   case $USE_LUKS in yes|no) ;; *) err+="Invalid LUKS setting.\n" ;; esac
   case $ASAHI_SETUP in native|gentoosupport) ;; *) err+="Invalid Asahi setup method.\n" ;; esac
   case $NETWORK in iwd|networkmanager|none) ;; *) err+="Invalid network selection.\n" ;; esac
-  case $STAGE_VARIANT in openrc|systemd|desktop-openrc|desktop-systemd|llvm-openrc|llvm-systemd) ;; *) err+="Invalid stage variant.\n" ;; esac
+  case $STAGE_VARIANT in openrc|systemd|desktop-openrc|desktop-systemd|llvm-openrc|llvm-systemd|musl-openrc|musl-systemd|musl-llvm-openrc|musl-llvm-systemd|musl-hardened-openrc|musl-hardened-systemd) ;; *) err+="Invalid stage variant.\n" ;; esac
   [[ -z $USER_NAME || ( $USER_NAME =~ ^[a-z_][a-z0-9_-]*$ && -n $USER_PW_HASH ) ]] || err+="Invalid username or missing user password.\n"
+  case $LIBC in glibc|musl) ;; *) err+="Invalid libc.\n" ;; esac
+  if [[ $LIBC == musl ]]; then
+    [[ $LOCALE == C.UTF-8 || $LOCALE == C || $LOCALE == POSIX ]] || err+="This musl path supports C.UTF-8, C, or POSIX locale.\n"
+    [[ $STAGE_VARIANT == musl-* ]] || err+="musl requires a musl stage3.\n"
+    [[ $PROFILE == ask-later || $PROFILE == */musl || $PROFILE == */musl/* ]] || err+="musl requires a musl profile.\n"
+    opt BINPKG && err+="The configured binary host is for glibc; disable BINPKG for musl.\n"
+    [[ $ASAHI_SETUP == native ]] || err+="musl requires experimental native Asahi setup.\n"
+  else
+    [[ $STAGE_VARIANT != musl-* ]] || err+="glibc requires a glibc stage3.\n"
+    [[ $PROFILE != */musl && $PROFILE != */musl/* ]] || err+="glibc cannot use a musl profile.\n"
+  fi
   if [[ $PROFILE != ask-later ]]; then
     if [[ $STAGE_VARIANT == *systemd ]]; then
       [[ $PROFILE == */systemd ]] || err+="systemd stage needs a systemd profile.\n"
@@ -392,11 +462,13 @@ configure() {
       part    "Partitions: esp=${ESP_PART:-?} root=${ROOT_PART:-?} swap=${SWAP_PART:-none}" \
       mkpart  "Create partition in free space (cfdisk)" \
       fs      "Filesystem: $ROOT_FS, LUKS=$USE_LUKS" \
+      libc    "C library: $LIBC" \
       stage   "Stage3: $STAGE_VARIANT" \
       profile "Profile: $PROFILE" \
       system  "System: $HOSTNAME_ / $TIMEZONE / $LOCALE / $KEYMAP" \
       users   "Users: root pw $mark, user=${USER_NAME:-none}" \
       options "Options: ${OPTIONS:-none}" \
+      jobs    "Build jobs: $BUILD_JOBS per package; one package at a time" \
       pkgs    "Network=$NETWORK, extra packages/USE" \
       asahi   "Asahi setup: $ASAHI_SETUP, ESP at $ESP_MOUNT" \
       save    "Save config to $CONF_FILE" \
@@ -406,10 +478,12 @@ configure() {
       part)    cfg_partitions ;;
       mkpart)  create_partition ;;
       fs)      cfg_filesystem ;;
+      libc)    cfg_libc ;;
       stage)   cfg_stage ;;
       profile) cfg_profile ;;
       system)  cfg_system ;;
       users)   cfg_users ;;
+      jobs)    cfg_build_jobs ;;
       options) cfg_options ;;
       pkgs)    cfg_packages ;;
       asahi)   cfg_asahi ;;
@@ -446,6 +520,7 @@ preflight() {
     btrfs) command -v mkfs.btrfs >/dev/null || die "mkfs.btrfs missing" ;;
     xfs) command -v mkfs.xfs >/dev/null || die "mkfs.xfs missing" ;;
   esac
+  wget -q --spider "$GENTOO_MIRROR/releases/arm64/autobuilds/latest-stage3-arm64-$STAGE_VARIANT.txt" || die "Selected stage listing is unavailable; root has not been formatted."
   wget -q --spider "$GENTOO_MIRROR" || die "No network / mirror unreachable ($GENTOO_MIRROR). Use net-setup or iwctl first."
   if findmnt -rn "$TARGET" >/dev/null 2>&1; then die "$TARGET is already mounted."; fi
   return 0
@@ -579,16 +654,56 @@ svc_enable() { # name
   else try rc-update add "$1" default; fi
 }
 
+# Reserve 2 GiB for the live system and budget 4 GiB per ordinary compile
+# job in optional auto mode. Do not count swap as RAM.
+build_jobs_for_memory() {
+  local available_kib=$1 cpus=$2 jobs=1
+  if ((available_kib > 2097152)); then jobs=$(( (available_kib - 2097152) / 4194304 )); fi
+  ((jobs >= 1)) || jobs=1
+  ((jobs <= cpus)) || jobs=$cpus
+  ((jobs <= 4)) || jobs=4
+  printf '%s\n' "$jobs"
+}
+
+configure_heavy_build_limits() {
+  local portage_dir=${1:-/etc/portage} jobs=${2:-$BUILD_JOBS} rules
+  [[ $jobs != auto ]] || jobs=1
+  mkdir -p "$portage_dir/env"
+  cat >"$portage_dir/env/asahi-low-memory.conf" <<EOF
+MAKEOPTS="-j$jobs"
+NINJAOPTS="-j$jobs"
+CMAKE_BUILD_PARALLEL_LEVEL="$jobs"
+EOF
+  if [[ -f $portage_dir/package.env ]]; then
+    rules=$portage_dir/package.env
+  else
+    mkdir -p "$portage_dir/package.env"
+    rules=$portage_dir/package.env/asahi-low-memory
+  fi
+  local atom line
+  for atom in dev-util/spirv-llvm-translator llvm-core/llvm llvm-core/clang media-libs/mesa sys-kernel/asahi-kernel; do
+    line="$atom asahi-low-memory.conf"
+    if ! grep -qxF "$line" "$rules" 2>/dev/null; then printf '%s\n' "$line" >>"$rules"; fi
+  done
+}
+
 s2_portage() {
   info "Configuring portage"
   local lic='-* @FREE @BINARY-REDISTRIBUTABLE'; opt LICENSES && lic='*'
-  local jobs; jobs=$(nproc)
+  local jobs available_kib
+  available_kib=$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)
+  valid_build_jobs "$BUILD_JOBS" || die "Invalid build job count."
+  if [[ $BUILD_JOBS == auto ]]; then
+    jobs=$(build_jobs_for_memory "${available_kib:-0}" "$(nproc)")
+  else jobs=$BUILD_JOBS; fi
+  info "Build limit: $jobs compile job(s) per package, one package at a time."
+  configure_heavy_build_limits /etc/portage "$jobs"
   {
     echo
     echo "# --- asahi-gentoo-install ---"
     echo "ACCEPT_LICENSE=\"$lic\""
     echo "MAKEOPTS=\"-j$jobs\""
-    echo "EMERGE_DEFAULT_OPTS=\"--jobs=2 --load-average=$jobs\""
+    echo "EMERGE_DEFAULT_OPTS=\"--jobs=1 --load-average=$jobs\""
     echo "VIDEO_CARDS=\"asahi\""
     echo "GRUB_PLATFORMS=\"efi-64\""
     echo "GENTOO_MIRRORS=\"$GENTOO_MIRROR\""
@@ -623,7 +738,7 @@ s2_profile() {
   if [[ $PROFILE == ask-later ]]; then
     local items=() n name
     while IFS=$'\t' read -r n name; do items+=("$n" "$name"); done < <(
-      eselect profile list | sed -n 's/^ *\[\([0-9]*\)\] *\([^ ]*\).*/\1\t\2/p' | awk -v init="$INIT" '$2 ~ /^default\/linux\/arm64\// && ((init == "systemd" && $2 ~ /\/systemd$/) || (init == "openrc" && $2 !~ /\/systemd$/))' || true)
+      eselect profile list | sed -n 's/^ *\[\([0-9]*\)\] *\([^ ]*\).*/\1\t\2/p' | awk -v libc="$LIBC" -v init="$INIT" '$2 ~ /^default\/linux\/arm64\// && ((libc == "musl" && $2 ~ /\/musl(\/|$)/) || (libc == "glibc" && $2 !~ /\/musl(\/|$)/)) && ((init == "systemd" && $2 ~ /\/systemd$/) || (init == "openrc" && $2 !~ /\/systemd$/))' || true)
     ui_menu "Profile" "Select a profile (init: $INIT)" "${items[@]}" || die "No profile selected."
     try eselect profile set "$RET"
   else
@@ -634,11 +749,14 @@ s2_profile() {
 
 s2_system() {
   info "Timezone, locale, keymap, hostname"
+  ensure_target_timezone
   echo "$TIMEZONE" >/etc/timezone
   ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+  if [[ $LIBC == glibc ]]; then
   grep -q "^$LOCALE " /etc/locale.gen 2>/dev/null || echo "$LOCALE UTF-8" >>/etc/locale.gen
   grep -q '^en_US.UTF-8 ' /etc/locale.gen || echo "en_US.UTF-8 UTF-8" >>/etc/locale.gen
   try locale-gen
+  fi
   mkdir -p /etc/env.d
   printf 'LANG="%s"\nLC_COLLATE="C.UTF-8"\n' "$LOCALE" >/etc/env.d/02locale
   echo "LANG=$LOCALE" >/etc/locale.conf
@@ -672,9 +790,19 @@ s2_fstab() {
   fi
 }
 
-s2_asahi_native() {
-  warn "Native Asahi setup is experimental. Prefer ASAHI_SETUP=gentoosupport if it fails."
-  emerge_pkgs dev-vcs/git
+# Apply a package-specific choice after inherited profile USE defaults.
+# Do not disable KDE globally: another explicitly chosen desktop may need it.
+configure_asahi_desktop() {
+  local portage_dir=${1:-/etc/portage} flag=-kde
+  if opt ASAHI_KDE; then flag=kde; fi
+  mkdir -p "$portage_dir/package.use"
+  printf 'sys-apps/asahi-meta %s\n' "$flag" >"$portage_dir/package.use/zz-asahi-installer-desktop"
+  info "Asahi KDE/KWin integration: $flag (change in Install options)"
+}
+
+# Prepare both installation paths before invoking the upstream helper.
+s2_prepare_asahi() {
+  mkdir -p /etc/portage/repos.conf /etc/portage/package.use /etc/portage/package.accept_keywords
   cat >/etc/portage/repos.conf/asahi.conf <<EOF
 [asahi]
 location = /var/db/repos/asahi
@@ -685,7 +813,30 @@ priority = 50
 EOF
   try emaint -r asahi sync
   echo '*/*::asahi ~arm64' >/etc/portage/package.accept_keywords/asahi
-  echo 'sys-kernel/installkernel dracut grub' >/etc/portage/package.use/installkernel
+  cat >/etc/portage/package.use/asahi-installer-fixes <<'EOF'
+media-video/pipewire lv2 extra
+sys-kernel/installkernel dracut grub
+net-libs/gnutls pkcs11
+EOF
+  configure_asahi_desktop
+  s2_asahi_bootstrap
+}
+
+s2_asahi_bootstrap() {
+  # Current overlay: kernel DEPENDs on m1n1; m1n1-bin RDEPENDs on the
+  # kernel virtual. Bootstrap only this prebuilt package without RDEPENDs;
+  # the complete Asahi merge below restores normal dependency resolution.
+  if ! portageq has_version / sys-boot/m1n1-bin && ! portageq has_version / sys-boot/m1n1; then
+    emerge_pkgs app-arch/unzip
+    info "Bootstrapping prebuilt m1n1 to break the Asahi kernel dependency cycle"
+    try emerge --oneshot --nodeps --verbose sys-boot/m1n1-bin::asahi
+  fi
+  # --newuse must rebuild an existing installkernel with the required flags.
+  try emerge --oneshot --update --newuse --verbose sys-kernel/installkernel
+}
+
+s2_asahi_native() {
+  warn "Native Asahi setup is experimental. Prefer ASAHI_SETUP=gentoosupport if it fails."
   emerge_pkgs sys-boot/grub sys-kernel/installkernel sys-apps/asahi-meta virtual/dist-kernel:asahi sys-kernel/linux-firmware
   try asahi-fwupdate
   try grub-install --target=arm64-efi --efi-directory="$ESP_MOUNT" --boot-directory=/boot --removable
@@ -694,6 +845,7 @@ EOF
 s2_asahi_support() {
   info "Installing Asahi support ($ASAHI_SETUP)"
   emerge_pkgs dev-vcs/git
+  s2_prepare_asahi
   if [[ $ASAHI_SETUP == gentoosupport ]]; then
     rm -rf /root/asahi-gentoosupport
     try git clone "$ASAHI_SUPPORT_URI" /root/asahi-gentoosupport
@@ -702,6 +854,7 @@ s2_asahi_support() {
   else
     s2_asahi_native
   fi
+  try emerge --oneshot --update --newuse --verbose sys-apps/asahi-meta virtual/dist-kernel:asahi
   try grub-mkconfig -o /boot/grub/grub.cfg
   if command -v update-m1n1 >/dev/null; then
     try update-m1n1 "$ESP_MOUNT/m1n1/boot.bin"

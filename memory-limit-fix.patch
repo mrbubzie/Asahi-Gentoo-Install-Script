@@ -1,0 +1,66 @@
+--- a/asahi-gentoo-install
++++ b/asahi-gentoo-install
+@@ -22,7 +22,7 @@
+ #
+ set -Eeuo pipefail
+ 
+-VERSION="0.1.3"
++VERSION="0.1.4"
+ SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ TARGET="/mnt/gentoo"
+ CONF_FILE="./asahi-gentoo.conf"
+@@ -592,16 +592,52 @@
+   else try rc-update add "$1" default; fi
+ }
+ 
++# Reserve 2 GiB for the live system and budget 4 GiB per ordinary compile
++# job. Do not count swap as RAM; heavy C++ packages get a stricter override.
++build_jobs_for_memory() {
++  local available_kib=$1 cpus=$2 jobs=1
++  if ((available_kib > 2097152)); then jobs=$(( (available_kib - 2097152) / 4194304 )); fi
++  ((jobs >= 1)) || jobs=1
++  ((jobs <= cpus)) || jobs=$cpus
++  ((jobs <= 4)) || jobs=4
++  printf '%s\n' "$jobs"
++}
++
++configure_heavy_build_limits() {
++  local portage_dir=${1:-/etc/portage} rules
++  mkdir -p "$portage_dir/env"
++  cat >"$portage_dir/env/asahi-low-memory.conf" <<'EOF'
++MAKEOPTS="-j1"
++NINJAOPTS="-j1"
++CMAKE_BUILD_PARALLEL_LEVEL="1"
++EOF
++  if [[ -f $portage_dir/package.env ]]; then
++    rules=$portage_dir/package.env
++  else
++    mkdir -p "$portage_dir/package.env"
++    rules=$portage_dir/package.env/asahi-low-memory
++  fi
++  local atom line
++  for atom in dev-util/spirv-llvm-translator llvm-core/llvm llvm-core/clang media-libs/mesa sys-kernel/asahi-kernel; do
++    line="$atom asahi-low-memory.conf"
++    if ! grep -qxF "$line" "$rules" 2>/dev/null; then printf '%s\n' "$line" >>"$rules"; fi
++  done
++}
++
+ s2_portage() {
+   info "Configuring portage"
+   local lic='-* @FREE @BINARY-REDISTRIBUTABLE'; opt LICENSES && lic='*'
+-  local jobs; jobs=$(nproc)
++  local jobs available_kib
++  available_kib=$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)
++  jobs=$(build_jobs_for_memory "${available_kib:-0}" "$(nproc)")
++  info "Build limit: $jobs compile job(s), one package at a time; heavy packages use one job."
++  configure_heavy_build_limits
+   {
+     echo
+     echo "# --- asahi-gentoo-install ---"
+     echo "ACCEPT_LICENSE=\"$lic\""
+     echo "MAKEOPTS=\"-j$jobs\""
+-    echo "EMERGE_DEFAULT_OPTS=\"--jobs=2 --load-average=$jobs\""
++    echo "EMERGE_DEFAULT_OPTS=\"--jobs=1 --load-average=$jobs\""
+     echo "VIDEO_CARDS=\"asahi\""
+     echo "GRUB_PLATFORMS=\"efi-64\""
+     echo "GENTOO_MIRRORS=\"$GENTOO_MIRROR\""

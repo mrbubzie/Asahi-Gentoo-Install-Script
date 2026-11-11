@@ -1,0 +1,70 @@
+--- a/asahi-gentoo-install
++++ b/asahi-gentoo-install
+@@ -22,7 +22,7 @@
+ #
+ set -Eeuo pipefail
+ 
+-VERSION="0.1.2"
++VERSION="0.1.3"
+ SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ TARGET="/mnt/gentoo"
+ CONF_FILE="./asahi-gentoo.conf"
+@@ -686,9 +686,9 @@
+   fi
+ }
+ 
+-s2_asahi_native() {
+-  warn "Native Asahi setup is experimental. Prefer ASAHI_SETUP=gentoosupport if it fails."
+-  emerge_pkgs dev-vcs/git
++# Prepare both installation paths before invoking the upstream helper.
++s2_prepare_asahi() {
++  mkdir -p /etc/portage/repos.conf /etc/portage/package.use /etc/portage/package.accept_keywords
+   cat >/etc/portage/repos.conf/asahi.conf <<EOF
+ [asahi]
+ location = /var/db/repos/asahi
+@@ -699,7 +699,28 @@
+ EOF
+   try emaint -r asahi sync
+   echo '*/*::asahi ~arm64' >/etc/portage/package.accept_keywords/asahi
+-  echo 'sys-kernel/installkernel dracut grub' >/etc/portage/package.use/installkernel
++  cat >/etc/portage/package.use/asahi-installer-fixes <<'EOF'
++media-video/pipewire lv2 extra
++sys-kernel/installkernel dracut grub
++EOF
++  s2_asahi_bootstrap
++}
++
++s2_asahi_bootstrap() {
++  # Current overlay: kernel DEPENDs on m1n1; m1n1-bin RDEPENDs on the
++  # kernel virtual. Bootstrap only this prebuilt package without RDEPENDs;
++  # the complete Asahi merge below restores normal dependency resolution.
++  if ! portageq has_version / sys-boot/m1n1-bin && ! portageq has_version / sys-boot/m1n1; then
++    emerge_pkgs app-arch/unzip
++    info "Bootstrapping prebuilt m1n1 to break the Asahi kernel dependency cycle"
++    try emerge --oneshot --nodeps --verbose sys-boot/m1n1-bin::asahi
++  fi
++  # --newuse must rebuild an existing installkernel with the required flags.
++  try emerge --oneshot --update --newuse --verbose sys-kernel/installkernel
++}
++
++s2_asahi_native() {
++  warn "Native Asahi setup is experimental. Prefer ASAHI_SETUP=gentoosupport if it fails."
+   emerge_pkgs sys-boot/grub sys-kernel/installkernel sys-apps/asahi-meta virtual/dist-kernel:asahi sys-kernel/linux-firmware
+   try asahi-fwupdate
+   try grub-install --target=arm64-efi --efi-directory="$ESP_MOUNT" --boot-directory=/boot --removable
+@@ -708,6 +729,7 @@
+ s2_asahi_support() {
+   info "Installing Asahi support ($ASAHI_SETUP)"
+   emerge_pkgs dev-vcs/git
++  s2_prepare_asahi
+   if [[ $ASAHI_SETUP == gentoosupport ]]; then
+     rm -rf /root/asahi-gentoosupport
+     try git clone "$ASAHI_SUPPORT_URI" /root/asahi-gentoosupport
+@@ -716,6 +738,7 @@
+   else
+     s2_asahi_native
+   fi
++  try emerge --oneshot --update --newuse --verbose sys-apps/asahi-meta virtual/dist-kernel:asahi
+   try grub-mkconfig -o /boot/grub/grub.cfg
+   if command -v update-m1n1 >/dev/null; then
+     try update-m1n1 "$ESP_MOUNT/m1n1/boot.bin"

@@ -1,0 +1,148 @@
+--- a/asahi-gentoo-install
++++ b/asahi-gentoo-install
+@@ -22,7 +22,7 @@
+ #
+ set -Eeuo pipefail
+ 
+-VERSION="0.1.6"
++VERSION="0.1.7"
+ SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ TARGET="/mnt/gentoo"
+ CONF_FILE="./asahi-gentoo.conf"
+@@ -33,7 +33,7 @@
+ # ---------------------------------------------------------------- config ----
+ CONFIG_VARS=(
+   ESP_PART ROOT_PART SWAP_PART ESP_MOUNT ROOT_FS USE_LUKS
+-  STAGE_VARIANT GENTOO_MIRROR PROFILE
++  LIBC STAGE_VARIANT GENTOO_MIRROR PROFILE
+   HOSTNAME_ TIMEZONE LOCALE KEYMAP
+   ROOT_PW_HASH USER_NAME USER_PW_HASH USER_GROUPS
+   OPTIONS NETWORK EXTRA_PACKAGES EXTRA_USE BUILD_JOBS
+@@ -45,6 +45,7 @@
+   ESP_MOUNT="/boot"           # Required by the Gentoo Asahi firmware and boot integration
+   ROOT_FS="ext4"              # ext4 | btrfs | xfs
+   USE_LUKS="no"
++  LIBC="glibc"
+   STAGE_VARIANT="desktop-openrc"
+   GENTOO_MIRROR="https://distfiles.gentoo.org"
+   PROFILE="ask-later"         # preset path | ask-later (pick from eselect list in chroot)
+@@ -267,7 +268,29 @@
+     USE_LUKS=yes; else USE_LUKS=no; fi
+ }
+ 
++cfg_libc() {
++  ui_menu "C library" "Choose libc for a NEW installation. musl Asahi support is experimental." \
++    glibc "glibc (default, widest compatibility)" musl "musl (experimental, source builds)" || return 0
++  [[ $RET != "$LIBC" ]] || return 0
++  LIBC=$RET; PROFILE=ask-later
++  if [[ $LIBC == musl ]]; then
++    LOCALE=C.UTF-8
++    STAGE_VARIANT=musl-openrc
++    ASAHI_SETUP=native
++    local item kept=""
++    for item in $OPTIONS; do [[ $item == BINPKG ]] || kept+="$item "; done
++    OPTIONS=${kept% }
++    ui_msg "musl" "Selected musl/OpenRC and native Asahi setup. The glibc binary host is disabled. Asahi package compatibility on musl is not verified."
++  else STAGE_VARIANT=desktop-openrc; fi
++}
++
+ cfg_stage() {
++  if [[ $LIBC == musl ]]; then
++    ui_menu "musl stage3" "arm64 musl stage (experimental)" \
++      musl-openrc "musl, OpenRC" musl-systemd "musl, systemd" \
++      musl-llvm-openrc "musl/LLVM, OpenRC" musl-llvm-systemd "musl/LLVM, systemd" \
++      musl-hardened-openrc "musl hardened, OpenRC" musl-hardened-systemd "musl hardened, systemd" || return 0
++  else
+   ui_menu "Stage3 variant" "arm64 stage3 tarball to install" \
+     openrc          "Minimal, OpenRC" \
+     systemd         "Minimal, systemd" \
+@@ -275,6 +298,7 @@
+     desktop-systemd "Desktop, systemd" \
+     llvm-openrc     "LLVM/clang toolchain, OpenRC" \
+     llvm-systemd    "LLVM/clang toolchain, systemd" || return 0
++  fi
+   STAGE_VARIANT=$RET
+   # a profile must match the init system, reset it
+   PROFILE="ask-later"
+@@ -284,6 +308,15 @@
+ cfg_profile() {
+   local sd=""; [[ $STAGE_VARIANT == *systemd ]] && sd="/systemd"
+   local b="default/linux/arm64/23.0"
++  if [[ $LIBC == musl ]]; then
++    b+="/musl"
++    [[ $STAGE_VARIANT != *llvm* ]] || b+="/llvm"
++    [[ $STAGE_VARIANT != *hardened* ]] || b+="/hardened"
++    ui_menu "musl profile" "Choose a musl profile matching the selected stage" \
++      ask-later "Choose in chroot" "$b$sd" "Matching musl profile" custom "Enter profile path" || return 0
++    if [[ $RET == custom ]]; then ui_input "Profile" "musl profile path" "$b$sd" || return 0; fi
++    PROFILE=$RET; return 0
++  fi
+   ui_menu "Profile" "Portage profile (init system must match the stage3: ${STAGE_VARIANT##*-})" \
+     ask-later              "Pick from 'eselect profile list' inside the chroot" \
+     "$b$sd"                "Base" \
+@@ -398,8 +431,19 @@
+   case $USE_LUKS in yes|no) ;; *) err+="Invalid LUKS setting.\n" ;; esac
+   case $ASAHI_SETUP in native|gentoosupport) ;; *) err+="Invalid Asahi setup method.\n" ;; esac
+   case $NETWORK in iwd|networkmanager|none) ;; *) err+="Invalid network selection.\n" ;; esac
+-  case $STAGE_VARIANT in openrc|systemd|desktop-openrc|desktop-systemd|llvm-openrc|llvm-systemd) ;; *) err+="Invalid stage variant.\n" ;; esac
++  case $STAGE_VARIANT in openrc|systemd|desktop-openrc|desktop-systemd|llvm-openrc|llvm-systemd|musl-openrc|musl-systemd|musl-llvm-openrc|musl-llvm-systemd|musl-hardened-openrc|musl-hardened-systemd) ;; *) err+="Invalid stage variant.\n" ;; esac
+   [[ -z $USER_NAME || ( $USER_NAME =~ ^[a-z_][a-z0-9_-]*$ && -n $USER_PW_HASH ) ]] || err+="Invalid username or missing user password.\n"
++  case $LIBC in glibc|musl) ;; *) err+="Invalid libc.\n" ;; esac
++  if [[ $LIBC == musl ]]; then
++    [[ $LOCALE == C.UTF-8 || $LOCALE == C || $LOCALE == POSIX ]] || err+="This musl path supports C.UTF-8, C, or POSIX locale.\n"
++    [[ $STAGE_VARIANT == musl-* ]] || err+="musl requires a musl stage3.\n"
++    [[ $PROFILE == ask-later || $PROFILE == */musl || $PROFILE == */musl/* ]] || err+="musl requires a musl profile.\n"
++    opt BINPKG && err+="The configured binary host is for glibc; disable BINPKG for musl.\n"
++    [[ $ASAHI_SETUP == native ]] || err+="musl requires experimental native Asahi setup.\n"
++  else
++    [[ $STAGE_VARIANT != musl-* ]] || err+="glibc requires a glibc stage3.\n"
++    [[ $PROFILE != */musl && $PROFILE != */musl/* ]] || err+="glibc cannot use a musl profile.\n"
++  fi
+   if [[ $PROFILE != ask-later ]]; then
+     if [[ $STAGE_VARIANT == *systemd ]]; then
+       [[ $PROFILE == */systemd ]] || err+="systemd stage needs a systemd profile.\n"
+@@ -418,6 +462,7 @@
+       part    "Partitions: esp=${ESP_PART:-?} root=${ROOT_PART:-?} swap=${SWAP_PART:-none}" \
+       mkpart  "Create partition in free space (cfdisk)" \
+       fs      "Filesystem: $ROOT_FS, LUKS=$USE_LUKS" \
++      libc    "C library: $LIBC" \
+       stage   "Stage3: $STAGE_VARIANT" \
+       profile "Profile: $PROFILE" \
+       system  "System: $HOSTNAME_ / $TIMEZONE / $LOCALE / $KEYMAP" \
+@@ -433,6 +478,7 @@
+       part)    cfg_partitions ;;
+       mkpart)  create_partition ;;
+       fs)      cfg_filesystem ;;
++      libc)    cfg_libc ;;
+       stage)   cfg_stage ;;
+       profile) cfg_profile ;;
+       system)  cfg_system ;;
+@@ -474,6 +520,7 @@
+     btrfs) command -v mkfs.btrfs >/dev/null || die "mkfs.btrfs missing" ;;
+     xfs) command -v mkfs.xfs >/dev/null || die "mkfs.xfs missing" ;;
+   esac
++  wget -q --spider "$GENTOO_MIRROR/releases/arm64/autobuilds/latest-stage3-arm64-$STAGE_VARIANT.txt" || die "Selected stage listing is unavailable; root has not been formatted."
+   wget -q --spider "$GENTOO_MIRROR" || die "No network / mirror unreachable ($GENTOO_MIRROR). Use net-setup or iwctl first."
+   if findmnt -rn "$TARGET" >/dev/null 2>&1; then die "$TARGET is already mounted."; fi
+   return 0
+@@ -691,7 +738,7 @@
+   if [[ $PROFILE == ask-later ]]; then
+     local items=() n name
+     while IFS=$'\t' read -r n name; do items+=("$n" "$name"); done < <(
+-      eselect profile list | sed -n 's/^ *\[\([0-9]*\)\] *\([^ ]*\).*/\1\t\2/p' | awk -v init="$INIT" '$2 ~ /^default\/linux\/arm64\// && ((init == "systemd" && $2 ~ /\/systemd$/) || (init == "openrc" && $2 !~ /\/systemd$/))' || true)
++      eselect profile list | sed -n 's/^ *\[\([0-9]*\)\] *\([^ ]*\).*/\1\t\2/p' | awk -v libc="$LIBC" -v init="$INIT" '$2 ~ /^default\/linux\/arm64\// && ((libc == "musl" && $2 ~ /\/musl(\/|$)/) || (libc == "glibc" && $2 !~ /\/musl(\/|$)/)) && ((init == "systemd" && $2 ~ /\/systemd$/) || (init == "openrc" && $2 !~ /\/systemd$/))' || true)
+     ui_menu "Profile" "Select a profile (init: $INIT)" "${items[@]}" || die "No profile selected."
+     try eselect profile set "$RET"
+   else
+@@ -705,9 +752,11 @@
+   ensure_target_timezone
+   echo "$TIMEZONE" >/etc/timezone
+   ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
++  if [[ $LIBC == glibc ]]; then
+   grep -q "^$LOCALE " /etc/locale.gen 2>/dev/null || echo "$LOCALE UTF-8" >>/etc/locale.gen
+   grep -q '^en_US.UTF-8 ' /etc/locale.gen || echo "en_US.UTF-8 UTF-8" >>/etc/locale.gen
+   try locale-gen
++  fi
+   mkdir -p /etc/env.d
+   printf 'LANG="%s"\nLC_COLLATE="C.UTF-8"\n' "$LOCALE" >/etc/env.d/02locale
+   echo "LANG=$LOCALE" >/etc/locale.conf

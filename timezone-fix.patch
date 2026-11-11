@@ -1,0 +1,48 @@
+--- a/asahi-gentoo-install
++++ b/asahi-gentoo-install
+@@ -22,7 +22,7 @@
+ #
+ set -Eeuo pipefail
+ 
+-VERSION="0.1.1"
++VERSION="0.1.2"
+ SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ TARGET="/mnt/gentoo"
+ CONF_FILE="./asahi-gentoo.conf"
+@@ -333,6 +333,19 @@
+   ASAHI_SETUP=$RET
+   ui_input "Overlay" "Asahi overlay git URI" "$ASAHI_OVERLAY_URI" && ASAHI_OVERLAY_URI=$RET || true
+   ui_input "Support repo" "asahi-gentoosupport git URI" "$ASAHI_SUPPORT_URI" && ASAHI_SUPPORT_URI=$RET || true
++}
++
++# Validate syntax here; live media may omit tzdata entirely. Validate the
++# actual timezone file inside Gentoo after ensuring tzdata is installed.
++valid_timezone_name() {
++  [[ $1 =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]]
++}
++
++ensure_target_timezone() {
++  if [[ ! -f /usr/share/zoneinfo/$TIMEZONE ]]; then
++    emerge_pkgs sys-libs/timezone-data
++  fi
++  [[ -f /usr/share/zoneinfo/$TIMEZONE ]] || die "Timezone '$TIMEZONE' is not present in Gentoo timezone-data. Check the spelling."
+ }
+ 
+ validate_config() {
+@@ -365,7 +378,7 @@
+   [[ $ESP_MOUNT == /boot ]] || err+="This installer requires the Asahi ESP at /boot.\n"
+   [[ $ASAHI_SETUP != gentoosupport || $ESP_MOUNT == /boot ]] || err+="gentoosupport requires ESP_MOUNT=/boot.\n"
+   [[ $HOSTNAME_ =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || err+="Invalid hostname.\n"
+-  [[ $TIMEZONE != /* && $TIMEZONE != *..* && -f /usr/share/zoneinfo/$TIMEZONE ]] || err+="Unknown timezone.\n"
++  valid_timezone_name "$TIMEZONE" || err+="Invalid timezone name. Use a name such as America/New_York.\n"
+   [[ $LOCALE =~ ^[a-zA-Z0-9_.@-]+$ ]] || err+="Invalid locale.\n"
+   [[ $KEYMAP =~ ^[a-zA-Z0-9_./-]+$ ]] || err+="Invalid keymap.\n"
+   case $ROOT_FS in ext4|btrfs|xfs) ;; *) err+="Invalid root filesystem.\n" ;; esac
+@@ -634,6 +647,7 @@
+ 
+ s2_system() {
+   info "Timezone, locale, keymap, hostname"
++  ensure_target_timezone
+   echo "$TIMEZONE" >/etc/timezone
+   ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+   grep -q "^$LOCALE " /etc/locale.gen 2>/dev/null || echo "$LOCALE UTF-8" >>/etc/locale.gen

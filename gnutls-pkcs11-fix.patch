@@ -1,0 +1,19 @@
+--- a/asahi-gentoo-install
++++ b/asahi-gentoo-install
+@@ -22,7 +22,7 @@
+ #
+ set -Eeuo pipefail
+ 
+-VERSION="0.1.7"
++VERSION="0.1.8"
+ SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ TARGET="/mnt/gentoo"
+ CONF_FILE="./asahi-gentoo.conf"
+@@ -816,6 +816,7 @@
+   cat >/etc/portage/package.use/asahi-installer-fixes <<'EOF'
+ media-video/pipewire lv2 extra
+ sys-kernel/installkernel dracut grub
++net-libs/gnutls pkcs11
+ EOF
+   configure_asahi_desktop
+   s2_asahi_bootstrap

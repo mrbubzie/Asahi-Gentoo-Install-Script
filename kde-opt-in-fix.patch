@@ -1,0 +1,44 @@
+--- a/asahi-gentoo-install
++++ b/asahi-gentoo-install
+@@ -22,7 +22,7 @@
+ #
+ set -Eeuo pipefail
+ 
+-VERSION="0.1.5"
++VERSION="0.1.6"
+ SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ TARGET="/mnt/gentoo"
+ CONF_FILE="./asahi-gentoo.conf"
+@@ -72,6 +72,7 @@
+   "GITSYNC"   "Sync the Gentoo tree via git instead of rsync"
+   "WORLD"     "Run full @world update after setup (slow)"
+   "NATIVE"    "Optimize for this CPU (-mcpu=native)"
++  "ASAHI_KDE" "Enable Asahi KDE/KWin integration (pulls KDE libraries)"
+   "SUDO"      "Install sudo and allow the wheel group"
+   "SSHD"      "Install and enable sshd"
+   "CHRONY"    "Install and enable chrony (time sync)"
+@@ -740,6 +741,16 @@
+   fi
+ }
+ 
++# Apply a package-specific choice after inherited profile USE defaults.
++# Do not disable KDE globally: another explicitly chosen desktop may need it.
++configure_asahi_desktop() {
++  local portage_dir=${1:-/etc/portage} flag=-kde
++  if opt ASAHI_KDE; then flag=kde; fi
++  mkdir -p "$portage_dir/package.use"
++  printf 'sys-apps/asahi-meta %s\n' "$flag" >"$portage_dir/package.use/zz-asahi-installer-desktop"
++  info "Asahi KDE/KWin integration: $flag (change in Install options)"
++}
++
+ # Prepare both installation paths before invoking the upstream helper.
+ s2_prepare_asahi() {
+   mkdir -p /etc/portage/repos.conf /etc/portage/package.use /etc/portage/package.accept_keywords
+@@ -757,6 +768,7 @@
+ media-video/pipewire lv2 extra
+ sys-kernel/installkernel dracut grub
+ EOF
++  configure_asahi_desktop
+   s2_asahi_bootstrap
+ }
+ 
