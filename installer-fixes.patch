@@ -1,0 +1,330 @@
+--- a/asahi-gentoo-install
++++ b/asahi-gentoo-install
+@@ -17,12 +17,12 @@
+ # Usage:
+ #   ./asahi-gentoo-install                 interactive menu
+ #   ./asahi-gentoo-install -c FILE         load FILE, open menu
+-#   ./asahi-gentoo-install -c FILE -y      load FILE, install unattended (after sanity checks)
++#   ./asahi-gentoo-install -c FILE -y      load FILE, skip destructive confirmation (other prompts remain)
+ #   ./asahi-gentoo-install --chroot /mnt/gentoo   mount helper + chroot into existing system
+ #
+ set -Eeuo pipefail
+ 
+-VERSION="0.1.0"
++VERSION="0.1.1"
+ SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ TARGET="/mnt/gentoo"
+ CONF_FILE="./asahi-gentoo.conf"
+@@ -42,7 +42,7 @@
+ 
+ set_defaults() {
+   ESP_PART=""; ROOT_PART=""; SWAP_PART=""
+-  ESP_MOUNT="/boot"           # /boot works with LUKS; /boot/efi is the Fedora-style alternative
++  ESP_MOUNT="/boot"           # Required by the Gentoo Asahi firmware and boot integration
+   ROOT_FS="ext4"              # ext4 | btrfs | xfs
+   USE_LUKS="no"
+   STAGE_VARIANT="desktop-openrc"
+@@ -80,10 +80,12 @@
+ 
+ save_config() {
+   local f=$1 v
++  ( umask 077
+   { echo "# asahi-gentoo-install config (v$VERSION)"
+     for v in "${CONFIG_VARS[@]}"; do printf '%s=%q\n' "$v" "${!v}"; done
+   } >"$f"
+   chmod 600 "$f"
++  )
+ }
+ 
+ load_config() { # shellcheck disable=SC1090
+@@ -170,16 +172,15 @@
+ }
+ 
+ # ------------------------------------------------------- checked commands ---
+-try() { # try cmd... : retry / shell / skip / abort on failure
++try() { # Essential commands must succeed; retry, shell, or abort.
+   local a
+   while true; do
+     "$@" && return 0
+     warn "Command failed: $*"
+-    read -r -p "[r]etry, [s]hell, s[k]ip, [a]bort? " a </dev/tty || a=a
++    read -r -p "[r]etry, [s]hell, [a]bort? " a </dev/tty || a=a
+     case $a in
+       r|R) ;;
+       s|S) bash </dev/tty || true ;;
+-      k|K) warn "Skipped."; return 0 ;;
+       *)   die "Aborted." ;;
+     esac
+   done
+@@ -189,7 +190,7 @@
+   local pw=$1
+   if command -v openssl >/dev/null 2>&1; then RET=$(openssl passwd -6 -stdin <<<"$pw")
+   elif command -v mkpasswd >/dev/null 2>&1; then RET=$(mkpasswd -m sha-512 -s <<<"$pw")
+-  else RET=$(python3 -c 'import crypt,sys; print(crypt.crypt(sys.stdin.readline().rstrip("\n"), crypt.mksalt(crypt.METHOD_SHA512)))' <<<"$pw"); fi
++  else die "Password hashing requires openssl or mkpasswd."; fi
+ }
+ 
+ ask_password() { # title -> hash in $RET
+@@ -252,8 +253,8 @@
+   if ui_yesno "Swap" "Use a swap partition?"; then
+     pick_partition swap "Swap partition. It WILL BE FORMATTED." && SWAP_PART=$RET || SWAP_PART=""
+   else SWAP_PART=""; fi
+-  ui_menu "ESP mount point" "Where should the ESP be mounted?\n/boot is simplest and works with LUKS." \
+-    "/boot" "ESP is /boot (recommended)" "/boot/efi" "ESP is /boot/efi (Fedora-style)" && ESP_MOUNT=$RET || true
++  ESP_MOUNT=/boot
++  info "The Asahi ESP will be mounted at /boot."
+ }
+ 
+ cfg_filesystem() {
+@@ -335,7 +336,7 @@
+ }
+ 
+ validate_config() {
+-  local err=""
++  local err="" p t id seen=" "
+   [[ -b $ESP_PART  ]] || err+="ESP partition not set or missing.\n"
+   [[ -b $ROOT_PART ]] || err+="Root partition not set or missing.\n"
+   [[ -z $SWAP_PART || -b $SWAP_PART ]] || err+="Swap partition missing.\n"
+@@ -343,11 +344,45 @@
+   [[ $ESP_PART != "$ROOT_PART" ]] || err+="ESP and root are the same partition.\n"
+   for p in "$ESP_PART" "$ROOT_PART" "$SWAP_PART"; do
+     [[ -z $p || ! -b $p ]] && continue
+-    local t; t=$(lsblk -no PARTTYPE "$p" | tr 'A-Z' 'a-z')
++    t=$(lsblk -dnro PARTTYPE "$p" | tr 'A-Z' 'a-z')
++    [[ $(lsblk -dnro TYPE "$p") == part ]] || err+="$p is not a partition.\n"
++    id=$(lsblk -dnro MAJ:MIN "$p")
++    if [[ -z $id || $seen == *" $id "* ]]; then err+="Devices overlap or cannot be identified: $p.\n"; fi
++    seen+="$id "
++    if lsblk -nrpo MOUNTPOINTS "$p" | grep -q '[^[:space:]]'; then err+="$p or a child device is mounted.\n"; fi
++    while read -r t; do
++      [[ -z $t ]] || err+="$p has an active child device ($t).\n"
++    done < <(lsblk -nrpo NAME "$p" | tail -n +2)
++    while read -r t; do
++      [[ -z $t ]] && continue
++      [[ $(lsblk -dnro MAJ:MIN "$t" 2>/dev/null || true) != "$id" ]] || err+="$p is active swap.\n"
++    done < <(swapon --show=NAME --noheadings --raw)
++    t=$(lsblk -dnro PARTTYPE "$p" | tr 'A-Z' 'a-z')
+     [[ $t == *"$APPLE_SUFFIX" ]] && err+="$p has an Apple partition type; refusing.\n"
+   done
++  [[ $(lsblk -dnro PARTTYPE "$ESP_PART" 2>/dev/null | tr 'A-Z' 'a-z') == "$ESP_GUID" ]] || err+="Selected ESP does not have the EFI partition type.\n"
++  [[ $(blkid -s TYPE -o value "$ESP_PART" 2>/dev/null || true) == vfat ]] || err+="ESP must already contain a FAT filesystem.\n"
++  [[ $ESP_MOUNT == /boot ]] || err+="This installer requires the Asahi ESP at /boot.\n"
++  [[ $ASAHI_SETUP != gentoosupport || $ESP_MOUNT == /boot ]] || err+="gentoosupport requires ESP_MOUNT=/boot.\n"
++  [[ $HOSTNAME_ =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || err+="Invalid hostname.\n"
++  [[ $TIMEZONE != /* && $TIMEZONE != *..* && -f /usr/share/zoneinfo/$TIMEZONE ]] || err+="Unknown timezone.\n"
++  [[ $LOCALE =~ ^[a-zA-Z0-9_.@-]+$ ]] || err+="Invalid locale.\n"
++  [[ $KEYMAP =~ ^[a-zA-Z0-9_./-]+$ ]] || err+="Invalid keymap.\n"
++  case $ROOT_FS in ext4|btrfs|xfs) ;; *) err+="Invalid root filesystem.\n" ;; esac
++  case $USE_LUKS in yes|no) ;; *) err+="Invalid LUKS setting.\n" ;; esac
++  case $ASAHI_SETUP in native|gentoosupport) ;; *) err+="Invalid Asahi setup method.\n" ;; esac
++  case $NETWORK in iwd|networkmanager|none) ;; *) err+="Invalid network selection.\n" ;; esac
++  case $STAGE_VARIANT in openrc|systemd|desktop-openrc|desktop-systemd|llvm-openrc|llvm-systemd) ;; *) err+="Invalid stage variant.\n" ;; esac
++  [[ -z $USER_NAME || ( $USER_NAME =~ ^[a-z_][a-z0-9_-]*$ && -n $USER_PW_HASH ) ]] || err+="Invalid username or missing user password.\n"
++  if [[ $PROFILE != ask-later ]]; then
++    if [[ $STAGE_VARIANT == *systemd ]]; then
++      [[ $PROFILE == */systemd ]] || err+="systemd stage needs a systemd profile.\n"
++    else
++      [[ $PROFILE != */systemd ]] || err+="OpenRC stage needs an OpenRC profile.\n"
++    fi
++  fi
+   [[ $PROFILE == ask-later || $PROFILE == default/linux/arm64/* ]] || err+="Profile should start with default/linux/arm64/.\n"
+-  if [[ -n $err ]]; then ui_msg "Configuration incomplete" "$(printf "$err")"; return 1; fi
++  if [[ -n $err ]]; then ui_msg "Configuration incomplete" "$(printf '%b' "$err")"; return 1; fi
+ }
+ 
+ configure() {
+@@ -389,19 +424,22 @@
+ MOUNTED=0; SWAP_ACTIVE=""; CRYPT_OPEN=0
+ 
+ cleanup() {
+-  set +e
+-  cd /
+-  [[ -n $SWAP_ACTIVE ]] && swapoff "$SWAP_ACTIVE" 2>/dev/null
+-  ((MOUNTED)) && umount -R "$TARGET" 2>/dev/null
+-  ((CRYPT_OPEN)) && cryptsetup close cryptroot 2>/dev/null
++  cd / || return 1
++  if [[ -n $SWAP_ACTIVE ]]; then swapoff "$SWAP_ACTIVE" || return 1; SWAP_ACTIVE=""; fi
++  if ((MOUNTED)); then umount -R "$TARGET" || return 1; MOUNTED=0; fi
++  if ((CRYPT_OPEN)); then cryptsetup close cryptroot || return 1; CRYPT_OPEN=0; fi
++  return 0
+ }
+ 
+ preflight() {
+   [[ $EUID -eq 0 ]] || die "Run as root."
+   [[ $(uname -m) == aarch64 ]] || die "This installer only runs on aarch64 (Apple Silicon)."
+-  local t; for t in lsblk blkid wget tar gpg mkfs.vfat chroot; do
++  local t; for t in lsblk blkid wget tar chroot wipefs findmnt mountpoint mount umount swapon swapoff install readlink awk grep; do
+     command -v "$t" >/dev/null 2>&1 || die "Missing tool: $t"
+   done
++  if opt VERIFY; then command -v gpg >/dev/null || die "gpg missing."; fi
++  [[ -r /proc/device-tree/compatible ]] && grep -aq 'apple,' /proc/device-tree/compatible || die "Apple Silicon device tree not detected."
++  [[ -r /dev/tty && -w /dev/tty ]] || die "An interactive terminal is required, including with -y."
+   [[ $USE_LUKS == yes ]] && { command -v cryptsetup >/dev/null || die "cryptsetup missing."; }
+   case $ROOT_FS in
+     ext4) command -v mkfs.ext4 >/dev/null || die "mkfs.ext4 missing" ;;
+@@ -409,14 +447,25 @@
+     xfs) command -v mkfs.xfs >/dev/null || die "mkfs.xfs missing" ;;
+   esac
+   wget -q --spider "$GENTOO_MIRROR" || die "No network / mirror unreachable ($GENTOO_MIRROR). Use net-setup or iwctl first."
+-  findmnt -rn "$TARGET" >/dev/null 2>&1 && die "$TARGET is already mounted."
++  if findmnt -rn "$TARGET" >/dev/null 2>&1; then die "$TARGET is already mounted."; fi
++  return 0
++}
++
++check_asahi_esp() {
++  local probe status=0
++  probe=$(mktemp -d)
++  if ! mount -o ro "$ESP_PART" "$probe"; then rmdir "$probe"; die "Cannot inspect the Asahi ESP."; fi
++  [[ -f $probe/m1n1/boot.bin && -d $probe/vendorfw ]] || status=1
++  if ! umount "$probe"; then die "Cannot unmount ESP inspection mount: $probe"; fi
++  rmdir "$probe"
++  ((status == 0)) || die "Selected ESP lacks m1n1/boot.bin or vendorfw; root has not been formatted."
+ }
+ 
+ confirm_destruction() {
+   local msg="About to ERASE and FORMAT:\n\n  root: $ROOT_PART ($ROOT_FS, LUKS=$USE_LUKS)"
+   [[ -n $SWAP_PART ]] && msg+="\n  swap: $SWAP_PART"
+   msg+="\n\nThe ESP $ESP_PART is mounted at $ESP_MOUNT and NOT formatted.\nNo partition table changes are made."
+-  if ((ASSUME_YES)); then info "$(printf "$msg")"; return 0; fi
++  if ((ASSUME_YES)); then info "$(printf '%b' "$msg")"; return 0; fi
+   ui_yesno "Confirm" "$msg\n\nContinue?" || die "Cancelled."
+   local a; read -r -p "Type the root device name to confirm ($ROOT_PART): " a </dev/tty
+   [[ $a == "$ROOT_PART" ]] || die "Confirmation mismatch."
+@@ -445,10 +494,10 @@
+   try mount -o "$mo" "$dev" "$TARGET"; MOUNTED=1
+   mkdir -p "$TARGET$ESP_MOUNT"
+   try mount "$ESP_PART" "$TARGET$ESP_MOUNT"
++  [[ -d $TARGET$ESP_MOUNT/vendorfw ]] || die "Asahi vendor firmware is missing from the selected ESP."
+   ROOT_FS_DEV=$dev
+   if [[ ! -e $TARGET$ESP_MOUNT/m1n1/boot.bin ]]; then
+-    warn "m1n1/boot.bin not found on $ESP_PART - this may not be the Asahi stub ESP."
+-    ((ASSUME_YES)) || ui_yesno "ESP check" "m1n1/boot.bin was not found on the selected ESP.\nContinue anyway?" || die "Cancelled."
++    die "m1n1/boot.bin is missing; select the Asahi stub ESP."
+   fi
+ }
+ 
+@@ -502,8 +551,10 @@
+ }
+ 
+ install_main() {
+-  trap cleanup EXIT
++  trap 'rc=$?; cleanup || { warn "Cleanup failed; inspect mounts before rebooting."; rc=1; }; exit "$rc"' EXIT
+   preflight
++  validate_config || die "Configuration failed safety checks."
++  check_asahi_esp
+   confirm_destruction
+   format_and_mount
+   fetch_stage3
+@@ -524,8 +575,8 @@
+ # Runs INSIDE the chroot.
+ emerge_pkgs() { try emerge --autounmask-continue --noreplace -v "$@"; }
+ svc_enable() { # name
+-  if [[ $INIT == systemd ]]; then systemctl enable "$1.service" || true
+-  else rc-update add "$1" default || true; fi
++  if [[ $INIT == systemd ]]; then try systemctl enable "$1.service"
++  else try rc-update add "$1" default; fi
+ }
+ 
+ s2_portage() {
+@@ -572,7 +623,7 @@
+   if [[ $PROFILE == ask-later ]]; then
+     local items=() n name
+     while IFS=$'\t' read -r n name; do items+=("$n" "$name"); done < <(
+-      eselect profile list | sed -n 's/^ *\[\([0-9]*\)\] *\([^ ]*\).*/\1\t\2/p' | grep -E "$INIT|^[0-9]+\s+default/linux/arm64" || true)
++      eselect profile list | sed -n 's/^ *\[\([0-9]*\)\] *\([^ ]*\).*/\1\t\2/p' | awk -v init="$INIT" '$2 ~ /^default\/linux\/arm64\// && ((init == "systemd" && $2 ~ /\/systemd$/) || (init == "openrc" && $2 !~ /\/systemd$/))' || true)
+     ui_menu "Profile" "Select a profile (init: $INIT)" "${items[@]}" || die "No profile selected."
+     try eselect profile set "$RET"
+   else
+@@ -635,7 +686,8 @@
+   try emaint -r asahi sync
+   echo '*/*::asahi ~arm64' >/etc/portage/package.accept_keywords/asahi
+   echo 'sys-kernel/installkernel dracut grub' >/etc/portage/package.use/installkernel
+-  emerge_pkgs sys-boot/grub sys-kernel/installkernel sys-apps/asahi-meta
++  emerge_pkgs sys-boot/grub sys-kernel/installkernel sys-apps/asahi-meta virtual/dist-kernel:asahi sys-kernel/linux-firmware
++  try asahi-fwupdate
+   try grub-install --target=arm64-efi --efi-directory="$ESP_MOUNT" --boot-directory=/boot --removable
+ }
+ 
+@@ -650,26 +702,27 @@
+   else
+     s2_asahi_native
+   fi
+-  [[ $USE_LUKS == yes ]] && command -v grub-mkconfig >/dev/null && try grub-mkconfig -o /boot/grub/grub.cfg
++  try grub-mkconfig -o /boot/grub/grub.cfg
+   if command -v update-m1n1 >/dev/null; then
+-    if [[ -e $ESP_MOUNT/m1n1/boot.bin ]]; then try update-m1n1 "$ESP_MOUNT/m1n1/boot.bin"
+-    else try update-m1n1; fi
+-  else warn "update-m1n1 not found; run it manually after the first boot setup."; fi
++    try update-m1n1 "$ESP_MOUNT/m1n1/boot.bin"
++  else die "update-m1n1 is missing; boot setup is incomplete."; fi
+ }
+ 
+ s2_network() {
+   info "Network: $NETWORK"
+   case $NETWORK in
+     iwd)
+-      emerge_pkgs net-wireless/iwd
++      emerge_pkgs net-wireless/iwd net-dns/openresolv
++      if [[ $INIT == openrc ]]; then svc_enable dbus; fi
+       mkdir -p /etc/iwd
+-      printf '[General]\nEnableNetworkConfiguration=true\n' >/etc/iwd/main.conf
++      printf '[General]\nEnableNetworkConfiguration=true\n[Network]\nNameResolvingService=resolvconf\n' >/etc/iwd/main.conf
+       svc_enable iwd ;;
+     networkmanager)
+       echo 'net-misc/networkmanager iwd' >>/etc/portage/package.use/networkmanager
+       emerge_pkgs net-misc/networkmanager net-wireless/iwd
+       mkdir -p /etc/NetworkManager/conf.d
+       printf '[device]\nwifi.backend=iwd\n' >/etc/NetworkManager/conf.d/wifi_backend.conf
++      if [[ $INIT == openrc ]]; then svc_enable dbus; fi
+       svc_enable iwd; svc_enable NetworkManager ;;
+     none) ;;
+   esac
+@@ -681,7 +734,9 @@
+   if [[ -n $USER_NAME ]]; then
+     local g groups=""
+     for g in ${USER_GROUPS//,/ }; do getent group "$g" >/dev/null && groups+="$g,"; done
+-    try useradd -m -s /bin/bash ${groups:+-G "${groups%,}"} "$USER_NAME"
++    local user_args=(-m -s /bin/bash)
++    [[ -z $groups ]] || user_args+=(-G "${groups%,}")
++    try useradd "${user_args[@]}" "$USER_NAME"
+     echo "$USER_NAME:$USER_PW_HASH" | chpasswd -e
+   fi
+   if opt SUDO; then
+@@ -693,7 +748,7 @@
+ }
+ 
+ s2_extras() {
+-  if opt SSHD;   then svc_enable sshd; fi
++  if opt SSHD;   then emerge_pkgs net-misc/openssh; svc_enable sshd; fi
+   if opt CHRONY; then emerge_pkgs net-misc/chrony; svc_enable chronyd; fi
+   if [[ $INIT == systemd ]]; then systemd-machine-id-setup 2>/dev/null || true; fi
+   # shellcheck disable=SC2086
+@@ -706,7 +761,10 @@
+   # shellcheck disable=SC1090
+   source "$CHROOT_CONF"
+   # shellcheck disable=SC1091
++  # Gentoo profile scripts need not be safe under nounset.
++  set +u
+   source /etc/profile
++  set -u
+   INIT=${STAGE_VARIANT##*-}
+   [[ $INIT == openrc || $INIT == systemd ]] || INIT=openrc
+   s2_portage
+@@ -728,9 +786,9 @@
+   local mode=menu conf_given=0
+   while (($#)); do
+     case $1 in
+-      -c|--config) CONF_FILE=$2; conf_given=1; shift ;;
++      -c|--config) [[ $# -ge 2 ]] || die "--config needs a filename"; CONF_FILE=$2; conf_given=1; shift ;;
+       -y|--yes)    ASSUME_YES=1 ;;
+-      --chroot)    mode=chroot; TARGET=$2; shift ;;
++      --chroot)    [[ $# -ge 2 ]] || die "--chroot needs a directory"; mode=chroot; TARGET=$2; shift ;;
+       --stage2)    mode=stage2 ;;
+       -h|--help)   usage ;;
+       *)           die "Unknown argument: $1 (try --help)" ;;
+@@ -753,4 +811,4 @@
+   install_main
+ }
+ 
+-main "$@"
++if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
